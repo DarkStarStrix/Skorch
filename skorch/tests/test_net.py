@@ -16,6 +16,7 @@ from unittest.mock import call
 from unittest.mock import patch
 import sys
 import time
+import warnings
 from contextlib import ExitStack
 
 from flaky import flaky
@@ -30,6 +31,7 @@ from sklearn.preprocessing import StandardScaler
 import torch
 from torch import nn
 
+import skorch
 from skorch.tests.conftest import INFERENCE_METHODS
 from skorch.utils import flatten
 from skorch.utils import to_numpy
@@ -468,6 +470,7 @@ class TestNeuralNet:
             cuda_available,
             load_dev,
             expect_warning,
+            recwarn,
     ):
         from skorch.exceptions import DeviceWarning
         net = net_cls(module=module_cls, device=save_dev).initialize()
@@ -479,9 +482,12 @@ class TestNeuralNet:
 
         with patch('torch.cuda.is_available', lambda *_: cuda_available):
             with open(str(p), 'rb') as f:
-                expected_warning = DeviceWarning if expect_warning else None
-                with pytest.warns(expected_warning) as w:
+                if not expect_warning:
                     m = pickle.load(f)
+                    assert not any(w.category == DeviceWarning for w in recwarn.list)
+                else:
+                    with pytest.warns(DeviceWarning) as w:
+                        m = pickle.load(f)
 
         assert torch.device(m.device) == torch.device(load_dev)
 
@@ -489,11 +495,17 @@ class TestNeuralNet:
             # We should have captured two warnings:
             # 1. one for the failed load
             # 2. for switching devices on the net instance
-            assert len(w.list) == 2
-            assert w.list[0].message.args[0] == (
+            # remove possible future warning about weights_only=False
+            # TODO: remove filter when torch<=2.4 is dropped
+            w_list = [
+                warning for warning in w.list
+                if "weights_only=False" not in warning.message.args[0]
+            ]
+            assert len(w_list) == 2
+            assert w_list[0].message.args[0] == (
                 'Requested to load data to CUDA but no CUDA devices '
                 'are available. Loading on device "cpu" instead.')
-            assert w.list[1].message.args[0] == (
+            assert w_list[1].message.args[0] == (
                 'Setting self.device = {} since the requested device ({}) '
                 'is not available.'.format(load_dev, save_dev))
 
@@ -556,6 +568,17 @@ class TestNeuralNet:
                "Module or Optimizer; make sure that it exists and check for typos.")
         with pytest.raises(AttributeError, match=msg):
             net_fit.load_params(f_unknown='some-file.pt')
+
+    def test_load_params_no_warning(self, net_fit, tmp_path, recwarn):
+        # See discussion in 1063
+        # Ensure that there is no FutureWarning (and DeprecationWarning for good
+        # measure) caused by torch.load.
+        net_fit.save_params(f_params=tmp_path / 'weights.pt')
+        net_fit.load_params(f_params=tmp_path / 'weights.pt')
+        assert not any(
+            isinstance(warning.message, (DeprecationWarning, FutureWarning))
+            for warning in recwarn.list
+        )
 
     @pytest.mark.parametrize('use_safetensors', [False, True])
     def test_save_load_state_dict_file(
@@ -2979,6 +3002,101 @@ class TestNeuralNet:
         weights_loaded = net_new.custom_.state_dict()['sequential.3.weight']
         assert (weights_before == weights_loaded).all()
 
+    def test_torch_load_kwargs_auto_weights_only_false_when_load_params(
+            self, net_cls, module_cls, monkeypatch, tmp_path
+    ):
+        # Here we assume that the torch version is low enough that weights_only
+        # defaults to False. Check that when no argument is set in skorch, the
+        # right default is used.
+        # See discussion in 1063
+        net = net_cls(module_cls).initialize()
+        net.save_params(f_params=tmp_path / 'params.pkl')
+        state_dict = net.module_.state_dict()
+        expected_kwargs = {"weights_only": False}
+
+        mock_torch_load = Mock(return_value=state_dict)
+        monkeypatch.setattr(torch, "load", mock_torch_load)
+        monkeypatch.setattr(
+            skorch.net, "get_default_torch_load_kwargs", lambda: expected_kwargs
+        )
+
+        net.load_params(f_params=tmp_path / 'params.pkl')
+
+        call_kwargs = mock_torch_load.call_args_list[0].kwargs
+        del call_kwargs['map_location']  # we're not interested in that
+        assert call_kwargs == expected_kwargs
+
+    def test_torch_load_kwargs_auto_weights_only_true_when_load_params(
+            self, net_cls, module_cls, monkeypatch, tmp_path
+    ):
+        # Here we assume that the torch version is high enough that weights_only
+        # defaults to True. Check that when no argument is set in skorch, the
+        # right default is used.
+        # See discussion in 1063
+        net = net_cls(module_cls).initialize()
+        net.save_params(f_params=tmp_path / 'params.pkl')
+        state_dict = net.module_.state_dict()
+        expected_kwargs = {"weights_only": True}
+
+        mock_torch_load = Mock(return_value=state_dict)
+        monkeypatch.setattr(torch, "load", mock_torch_load)
+        monkeypatch.setattr(
+            skorch.net, "get_default_torch_load_kwargs", lambda: expected_kwargs
+        )
+
+        net.load_params(f_params=tmp_path / 'params.pkl')
+
+        call_kwargs = mock_torch_load.call_args_list[0].kwargs
+        del call_kwargs['map_location']  # we're not interested in that
+        assert call_kwargs == expected_kwargs
+
+    def test_torch_load_kwargs_forwarded_to_torch_load(
+            self, net_cls, module_cls, monkeypatch, tmp_path
+    ):
+        # Here we check that custom set torch load args are forwarded to
+        # torch.load.
+        # See discussion in 1063
+        expected_kwargs = {'weights_only': 123, 'foo': 'bar'}
+        net = net_cls(module_cls, torch_load_kwargs=expected_kwargs).initialize()
+        net.save_params(f_params=tmp_path / 'params.pkl')
+        state_dict = net.module_.state_dict()
+
+        mock_torch_load = Mock(return_value=state_dict)
+        monkeypatch.setattr(torch, "load", mock_torch_load)
+
+        net.load_params(f_params=tmp_path / 'params.pkl')
+
+        call_kwargs = mock_torch_load.call_args_list[0].kwargs
+        del call_kwargs['map_location']  # we're not interested in that
+        assert call_kwargs == expected_kwargs
+
+    def test_torch_load_kwargs_auto_weights_false_pytorch_lt_2_6(
+            self, net_cls, module_cls, monkeypatch, tmp_path
+    ):
+        # Same test as
+        # test_torch_load_kwargs_auto_weights_only_false_when_load_params but
+        # without monkeypatching get_default_torch_load_kwargs. There is no
+        # corresponding test for >= 2.6.0 since it's not clear yet if the switch
+        # will be made in that version.
+        # See discussion in 1063.
+        from skorch._version import Version
+
+        if Version(torch.__version__) >= Version('2.6.0'):
+            pytest.skip("Test only for torch < v2.6.0")
+
+        net = net_cls(module_cls).initialize()
+        net.save_params(f_params=tmp_path / 'params.pkl')
+        state_dict = net.module_.state_dict()
+        expected_kwargs = {"weights_only": False}
+
+        mock_torch_load = Mock(return_value=state_dict)
+        monkeypatch.setattr(torch, "load", mock_torch_load)
+        net.load_params(f_params=tmp_path / 'params.pkl')
+
+        call_kwargs = mock_torch_load.call_args_list[0].kwargs
+        del call_kwargs['map_location']  # we're not interested in that
+        assert call_kwargs == expected_kwargs
+
     def test_custom_module_params_passed_to_optimizer(
             self, net_custom_module_cls, module_cls):
         # custom module parameters should automatically be passed to the optimizer
@@ -4142,6 +4260,13 @@ class TestTorchCompile:
         if not hasattr(torch, 'compile'):
             pytest.skip(reason="torch.compile not available")
 
+        # python 3.12 requires torch >= 2.4 to support compile
+        # TODO: remove once we remove support for torch < 2.4
+        from skorch._version import Version
+
+        if Version(torch.__version__) < Version('2.4.0') and sys.version_info >= (3, 12):
+            pytest.skip(reason="When using Python 3.12, torch.compile requires torch >= 2.4")
+
         # use real torch.compile, not mocked, can be a bit slow
         X, y = data
         net = net_cls(module_cls, max_epochs=1, compile=True).initialize()
@@ -4155,3 +4280,43 @@ class TestTorchCompile:
         # compiled, we rely here on torch keeping this public attribute
         assert hasattr(net.module_, 'dynamo_ctx')
         assert hasattr(net.criterion_, 'dynamo_ctx')
+
+    def test_binary_classifier_with_compile(self, data):
+        # issue 1057 the problem was that compile would wrap the optimizer,
+        # resulting in _infer_predict_nonlinearity to return the wrong result
+        # because of a failing isinstance check
+        from skorch import NeuralNetBinaryClassifier
+
+        # python 3.12 requires torch >= 2.4 to support compile
+        # TODO: remove once we remove support for torch < 2.4
+        from skorch._version import Version
+
+        if Version(torch.__version__) < Version('2.4.0') and sys.version_info >= (3, 12):
+            pytest.skip(reason="When using Python 3.12, torch.compile requires torch >= 2.4")
+
+        X, y = data[0], data[1].astype(np.float32)
+
+        class MyNet(nn.Module):
+            def __init__(self):
+                super(MyNet, self).__init__()
+                self.linear = nn.Linear(20, 10)
+                self.output = nn.Linear(10, 1)
+
+            def forward(self, input):
+                out = self.linear(input)
+                out = nn.functional.relu(out)
+                out = self.output(out)
+                return out.squeeze(-1)
+
+        net = NeuralNetBinaryClassifier(
+            MyNet,
+            max_epochs=3,
+            compile=True,
+        )
+        # check that no error is raised
+        net.fit(X, y)
+
+        y_proba = net.predict_proba(X)
+        y_pred = net.predict(X)
+        assert y_proba.shape == (X.shape[0], 2)
+        assert y_pred.shape == (X.shape[0],)

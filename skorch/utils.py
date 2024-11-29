@@ -28,6 +28,7 @@ from torch.utils.data.dataset import Subset
 
 from skorch.exceptions import DeviceWarning
 from skorch.exceptions import NotInitializedError
+from ._version import Version
 
 try:
     import torch_geometric
@@ -660,6 +661,8 @@ def _infer_predict_nonlinearity(net):
         return _identity
 
     criterion = getattr(net, net._criteria[0] + '_')
+    # unwrap optimizer in case of torch.compile being used
+    criterion = getattr(criterion, '_orig_mod', criterion)
 
     if isinstance(criterion, CrossEntropyLoss):
         return partial(torch.softmax, dim=-1)
@@ -766,3 +769,18 @@ def _check_f_arguments(caller_name, **kwargs):
             key = 'module_' if key == 'f_params' else key[2:] + '_'
             kwargs_module[key] = val
     return kwargs_module, kwargs_other
+
+
+def get_default_torch_load_kwargs():
+    """Returns the kwargs passed to torch.load that correspond to the current
+    torch version.
+
+    The plan is to switch from weights_only=False to True in PyTorch version
+    2.6.0, but depending on what happens, this may require updating.
+
+    """
+    version_torch = Version(torch.__version__)
+    version_default_switch = Version('2.6.0')
+    if version_torch >= version_default_switch:
+        return {"weights_only": True}
+    return {"weights_only": False}
